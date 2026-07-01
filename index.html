@@ -120,7 +120,18 @@ const playerY = () => H * PLAYER_Y_FRAC;
 // === СТЕЙТ ИГРЫ ==================================================
 // =================================================================
 let game;
-let bestScore = 0, bestDist = 0; // рекорд в памяти страницы (без localStorage)
+let bestScore = 0, bestDist = 0; // рекорд в памяти страницы (фолбэк, если нет CloudStorage)
+
+// Однократное чтение рекорда из Telegram CloudStorage при загрузке.
+// Если CloudStorage недоступен (обычный браузер) — bestScore/bestDist остаются 0.
+if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.CloudStorage){
+  Telegram.WebApp.CloudStorage.getItem('bestScore', function(err, val){
+    if (!err && val){ const n = parseInt(val, 10); if (!isNaN(n) && n > bestScore) bestScore = n; }
+  });
+  Telegram.WebApp.CloudStorage.getItem('bestDist', function(err, val){
+    if (!err && val){ const n = parseInt(val, 10); if (!isNaN(n) && n > bestDist) bestDist = n; }
+  });
+}
 
 function newGame(){
   game = {
@@ -512,6 +523,11 @@ function endRun(){
   game.recordBeaten = (sc > bestScore || ds > bestDist);
   if (sc > bestScore) bestScore = sc;
   if (ds > bestDist) bestDist = ds;
+  // Сохраняем рекорд в Telegram CloudStorage, если доступен; иначе оставляем только в памяти.
+  if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.CloudStorage){
+    Telegram.WebApp.CloudStorage.setItem('bestScore', String(bestScore), function(){});
+    Telegram.WebApp.CloudStorage.setItem('bestDist', String(bestDist), function(){});
+  }
 }
 
 // =================================================================
