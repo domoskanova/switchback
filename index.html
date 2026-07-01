@@ -1,0 +1,1138 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Раннер Поход</title>
+<style>
+  /* центрируем canvas, чёрный фон, без прокрутки */
+  html,body{margin:0;height:100%;background:#111;overflow:hidden;
+    display:flex;align-items:center;justify-content:center;
+    font-family:system-ui,Arial,sans-serif;touch-action:none;}
+  #game{background:#1c2a1c;display:block;max-height:100vh;}
+</style>
+</head>
+<body>
+<!-- КАК ИГРАТЬ: стрелки влево/вправо или свайп влево/вправо — смена полосы. -->
+<!-- Уходи от камней/веток/луж, собирай снаряжение, уворачивайся от медведя. -->
+<canvas id="game"></canvas>
+<script>
+// =================================================================
+// === КОНСТАНТЫ (числа из правил v1.0) ===========================
+// =================================================================
+const LANES = 3;                 // три полосы
+const START_LIVES = 3;           // старт: 3 жизни
+const INVULN_MS = 1500;          // неуязвимость после удара 1.5 сек
+const LANE_SWITCH_MS = 150;      // переход между полосами 0.15 сек
+const TENT_INVULN_MS = 3000;     // палатка даёт 3 сек неуязвимости
+
+// Скорость (метры/сек по дистанции)
+const SPEED_BASE = 9;            // 0–500 м: базовая 9 м/сек
+const SPEED_STEP = 2.5;          // каждые 500 м: +2.5 м/сек
+const SPEED_STEP_DIST = 500;     // шаг порога скорости
+const SPEED_CAP = 26;            // потолок 26 м/сек (достигается ~3500 м)
+
+// Частота препятствий (сек между спавнами) по порогам дистанции
+const OBST_INT_NEAR = 2.0;       // 0–500 м: каждые ~2.0 сек
+const OBST_INT_MID  = 1.4;       // 500–2000 м: каждые ~1.4 сек
+const OBST_INT_FAR  = 1.0;       // 2000+ м: каждые ~1.0 сек
+
+// Сколько полос максимум занято одновременно
+const LANES_BLOCKED_LOW = 1;     // 0–600 м: максимум 1 из 3
+const LANES_BLOCKED_HIGH = 2;    // 600+ м: максимум 2 из 3 (никогда не 3)
+const LANES_BLOCK_THRESHOLD = 600; // порог перехода 1→2 полосы (м)
+
+// Честность скорости (v1.1): окно реакции в секундах постоянно на любой скорости.
+// Объект появляется за экраном на расстоянии = скорость * это окно, поэтому
+// время от появления до игрока не зависит от скорости бега.
+const REACTION_WINDOW_S = 2.2;   // # нет в правилах, подобрано: окно реакции (сек), постоянное
+
+// Медведь
+const BEAR_MIN_INTERVAL = 20;    // не чаще раза в 20 сек
+const BEAR_WARNING_MS = 1200;    // предупреждение за 1.2 сек до входа
+
+// Снаряжение
+const ITEM_SCORE = 50;           // любой предмет: +50 очков
+const RARE_ITEM_INTERVAL = 30;   // спальник/палатка: ~1 на 30 сек каждый
+const RARE_ITEM_JITTER = 10;     // # нет в правилах, подобрано: разброс интервала редких ±сек, чтобы не выпадали синхронно
+
+// Очки
+const SCORE_PER_METER = 1;       // +1 очко за метр
+const NOHIT_BONUS_DIST = 500;    // каждые 500 м без урона
+const NOHIT_BONUS_PTS = 200;     // = +200 очков
+
+// --- ПОДОБРАННЫЕ ЧИСЛА (# нет в правилах, подобрано) ---
+const PLAYER_Y_FRAC = 0.82;      // # нет в правилах, подобрано: позиция игрока по высоте
+const SPAWN_Y = -60;             // # нет в правилах, подобрано: точка появления объектов сверху
+const OBST_SIZE = 46;            // # нет в правилах, подобрано: размер препятствия (px)
+const ITEM_SIZE = 38;            // # нет в правилах, подобрано: размер бонуса (px)
+const BEAR_SIZE = 72;            // # нет в правилах, подобрано: размер медведя (крупнее)
+const PLAYER_SIZE = 44;          // # нет в правилах, подобрано: размер игрока
+// Визуальные множители размера спрайтов (НЕ влияют на коллизии/спавн).
+// Подобраны так, чтобы препятствие воспринималось примерно в 1.4 раза крупнее бонуса:
+// итог = (OBST_SIZE*OBST_SCALE) / (ITEM_SIZE*ITEM_SCALE) ≈ (46*1.7)/(38*1.45) ≈ 1.42
+const ITEM_SCALE = 2.088;        // # нет в правилах, подобрано: множитель бонусов (×0.6 от 3.48)
+const OBST_SCALE = 3.468;        // # нет в правилах, подобрано: множитель препятствий (×0.85 от 4.08)
+const BEAR_SCALE = 1.6;          // # нет в правилах, подобрано: множитель медведя (без изменений)
+const PLAYER_SCALE = 1.705;      // # нет в правилах, подобрано: множитель игрока в игре (+10% от 1.55)
+const SWIPE_MIN = 30;            // # нет в правилах, подобрано: минимальный свайп (px)
+const ITEM_NEAR_OBST_CHANCE = 0.35; // # нет в правилах, подобрано: шанс поставить бонус рядом с препятствием (риск)
+
+// Цвета объектов
+const COL = {
+  stone:'#8a8a8a', branch:'#7a4a23', puddle:'#3a6ea5',  // препятствия
+  tent:'#d94f4f', pot:'#c9c9c9', sleep:'#5fbf6f', flask:'#e0b84a', // снаряжение
+  bear:'#3a2a1a', player:'#ffd24a', warn:'#ff3030'
+};
+const OBST_TYPES = ['stone','branch','puddle'];
+const ITEM_TYPES = ['tent','pot','sleep','flask']; // палатка, котелок, спальник, фляга
+const COMMON_ITEMS = ['flask','pot'];  // частые
+const RARE_ITEMS = ['sleep','tent'];   // редкие
+
+// =================================================================
+// === CANVAS / РАЗМЕРЫ ============================================
+// =================================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, laneW = 0;
+
+function resize(){
+  // вертикальный экран под мобилу, ограничен высотой окна
+  H = Math.min(window.innerHeight, 900);
+  W = Math.min(window.innerWidth, Math.round(H * 0.56));
+  canvas.width = W; canvas.height = H;
+  laneW = W / LANES;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const laneCenterX = (lane) => laneW * lane + laneW / 2;
+const playerY = () => H * PLAYER_Y_FRAC;
+
+// =================================================================
+// === СТЕЙТ ИГРЫ ==================================================
+// =================================================================
+let game;
+let bestScore = 0, bestDist = 0; // рекорд в памяти страницы (без localStorage)
+
+function newGame(){
+  game = {
+    phase:'running',            // running | camp
+    lives: START_LIVES,
+    score: 0,
+    distance: 0,                // метры
+    speed: SPEED_BASE,          // текущая скорость м/сек
+    // игрок
+    lane: 1,                    // по умолчанию центральная
+    fromLane: 1, toLane: 1,
+    switchT: 0,                 // прогресс перехода (мс), >0 = в движении
+    invulnT: 0,                 // оставшаяся неуязвимость (мс)
+    // объекты
+    obstacles: [],              // {lane,y,type,hit}
+    items: [],                  // {lane,y,type}
+    bear: null,                 // {lane,y,warnT} warnT>0 = фаза предупреждения
+    // таймеры спавна
+    obstTimer: 0,
+    rareTimer: {sleep: RARE_ITEM_INTERVAL + Math.random()*RARE_ITEM_JITTER,
+                tent:  RARE_ITEM_INTERVAL + RARE_ITEM_JITTER + Math.random()*RARE_ITEM_JITTER},
+    commonTimer: 0,             // # нет в правилах, подобрано
+    bearTimer: BEAR_MIN_INTERVAL,
+    // прочее
+    collected: {tent:0,pot:0,sleep:0,flask:0},
+    distSinceHit: 0,            // для бонуса «без урона»
+    recordBeaten: false,
+    inputBuffer: 0,             // -1 / +1 / 0
+    bgScroll: 0,                // смещение фонового паттерна (px)
+  };
+}
+newGame();
+
+// =================================================================
+// === ВВОД (клавиши + свайп) =====================================
+// =================================================================
+function requestMove(dir){
+  // один свайп/нажатие = одна соседняя полоса; во время перехода ввод игнорируется
+  if (game.phase !== 'running') return;
+  if (game.switchT > 0) return;          // идёт переход — игнор
+  game.inputBuffer = dir;
+}
+
+window.addEventListener('keydown', (e)=>{
+  if (e.key === 'ArrowLeft')  requestMove(-1);
+  if (e.key === 'ArrowRight') requestMove(+1);
+});
+
+let touchX = null, touchY = null;
+canvas.addEventListener('touchstart',(e)=>{
+  const t=e.changedTouches[0]; touchX=t.clientX; touchY=t.clientY;
+},{passive:true});
+canvas.addEventListener('touchend',(e)=>{
+  if (touchX===null) return;
+  const t=e.changedTouches[0];
+  const dx=t.clientX-touchX, dy=t.clientY-touchY;
+  if (Math.abs(dx)>Math.abs(dy) && Math.abs(dx)>SWIPE_MIN){
+    requestMove(dx>0 ? +1 : -1);
+  } else if (game.phase==='camp'){
+    newGame(); // тап на экране привала = рестарт
+  }
+  touchX=touchY=null;
+},{passive:true});
+
+// клик мышью по экрану привала — рестарт
+canvas.addEventListener('click',()=>{ if(game.phase==='camp') newGame(); });
+
+// =================================================================
+// === ОБРАБОТКА ВВОДА (применяем буфер) ==========================
+// =================================================================
+function applyInput(){
+  if (game.inputBuffer === 0 || game.switchT > 0) { game.inputBuffer = 0; return; }
+  const target = game.lane + game.inputBuffer;
+  game.inputBuffer = 0;
+  // свайп наружу на крайней полосе — без движения, без отскока
+  if (target < 0 || target > LANES-1) return;
+  game.fromLane = game.lane;
+  game.toLane = target;
+  game.switchT = LANE_SWITCH_MS;
+}
+
+// текущая дробная позиция игрока по полосам (для плавного перехода)
+function playerLaneFloat(){
+  if (game.switchT <= 0) return game.lane;
+  const p = 1 - game.switchT / LANE_SWITCH_MS; // 0..1
+  return game.fromLane + (game.toLane - game.fromLane) * p;
+}
+
+// =================================================================
+// === СЛОЖНОСТЬ ПО ДИСТАНЦИИ ======================================
+// =================================================================
+function currentSpeed(){
+  const steps = Math.floor(game.distance / SPEED_STEP_DIST);
+  return Math.min(SPEED_BASE + steps * SPEED_STEP, SPEED_CAP);
+}
+function obstacleInterval(){
+  if (game.distance < 500) return OBST_INT_NEAR;
+  if (game.distance < 2000) return OBST_INT_MID;
+  return OBST_INT_FAR;
+}
+function maxBlockedLanes(){
+  return game.distance < LANES_BLOCK_THRESHOLD ? LANES_BLOCKED_LOW : LANES_BLOCKED_HIGH;
+}
+
+// Честность скорости (v1.1): скорость прокрутки в пикселях ПОСТОЯННА и не зависит
+// от игровой скорости бега. Путь от точки спавна до игрока проходится за
+// REACTION_WINDOW_S секунд при любой дистанции — окно реакции в секундах неизменно.
+// (Игровая скорость влияет только на набор метров/очков, см. update.)
+function scrollPxPerSec(){
+  const travel = playerY() - SPAWN_Y; // путь объекта по экрану, px
+  return travel / REACTION_WINDOW_S;
+}
+
+// =================================================================
+// === СПАВН объектов ==============================================
+// =================================================================
+function freeLanesNow(){
+  // полосы, занятые объектами в верхней зоне (чтобы не закрыть все три)
+  const occupied = new Set();
+  for (const o of game.obstacles) if (o.y < H*0.4) occupied.add(o.lane);
+  if (game.bear) occupied.add(game.bear.lane);
+  const free=[];
+  for (let l=0;l<LANES;l++) if(!occupied.has(l)) free.push(l);
+  return free;
+}
+
+function spawnObstacles(){
+  // инвариант: минимум одна полоса всегда свободна
+  const free = freeLanesNow();
+  const maxBlock = maxBlockedLanes();
+  // сколько ещё можно занять, оставив минимум 1 свободной
+  const alreadyBlocked = LANES - free.length;
+  let canBlock = Math.min(maxBlock - alreadyBlocked, free.length - 1);
+  if (canBlock <= 0) return;
+
+  // препятствие не ставим на полосу, где у верха уже летит предмет (иначе наложение)
+  const usable = free.filter(l=>!laneHasItemNearTop(l));
+  if (usable.length === 0) return;
+  canBlock = Math.min(canBlock, usable.length);
+  if (canBlock <= 0) return;
+
+  const count = 1 + (canBlock>1 && Math.random()<0.5 ? 1 : 0);
+  const pick = usable.slice();
+  // перемешиваем доступные полосы
+  for (let i=pick.length-1;i>0;i--){const j=(Math.random()*(i+1))|0;[pick[i],pick[j]]=[pick[j],pick[i]];}
+  const toUse = pick.slice(0, Math.min(count, canBlock));
+  for (const lane of toUse){
+    const type = OBST_TYPES[(Math.random()*OBST_TYPES.length)|0];
+    game.obstacles.push({lane, y:SPAWN_Y, type, hit:false});
+    // иногда рядом ставим бонус на другой полосе, свободной от препятствий и предметов (риск/награда)
+    if (Math.random() < ITEM_NEAR_OBST_CHANCE){
+      const others = [];
+      for (let l=0;l<LANES;l++) if (l!==lane && laneFreeForItem(l)) others.push(l);
+      if (others.length){
+        const il = others[(Math.random()*others.length)|0];
+        spawnItem(il); // без вертикального смещения — на штатную точку спавна
+      }
+    }
+  }
+}
+
+function laneHasItemNearTop(lane){
+  // есть ли уже предмет на этой полосе в верхней зоне (чтобы не клались друг на друга)
+  const ITEM_GAP = ITEM_SIZE*2.2; // # нет в правилах, подобрано: мин. зазор между предметами
+  for (const it of game.items){
+    if (it.lane === lane && it.y < ITEM_GAP) return true;
+  }
+  return false;
+}
+
+function laneHasObstacleNearTop(lane){
+  // есть ли препятствие на этой полосе в верхней зоне — чтобы предмет не лёг на него
+  const GAP = OBST_SIZE + ITEM_SIZE; // # нет в правилах, подобрано: зазор предмет/препятствие
+  for (const o of game.obstacles){
+    if (o.lane === lane && o.y < GAP) return true;
+  }
+  return false;
+}
+
+function laneHasBearNearTop(lane){
+  // есть ли медведь на этой полосе у верха (фаза предупреждения или вход в кадр)
+  const GAP = BEAR_SIZE + ITEM_SIZE; // # нет в правилах, подобрано: зазор медведь/предмет
+  if (!game.bear) return false;
+  // во время предупреждения медведь ещё не виден, но полоса уже застолблена под него
+  if (game.bear.lane !== lane) return false;
+  return game.bear.warnT > 0 || game.bear.y < GAP;
+}
+
+function laneFreeForItem(lane){
+  // полоса годится под предмет, только если на ней нет предмета, препятствия и медведя у верха
+  return !laneHasItemNearTop(lane) && !laneHasObstacleNearTop(lane) && !laneHasBearNearTop(lane);
+}
+
+function spawnItem(lane, y){
+  // частые предметы; не кладём, если полоса занята другим предметом или препятствием у верха
+  if (!laneFreeForItem(lane)) return;
+  const type = COMMON_ITEMS[(Math.random()*COMMON_ITEMS.length)|0];
+  game.items.push({lane, y:(y!==undefined?y:SPAWN_Y), type});
+}
+
+// следующий интервал редкого предмета с разбросом — чтобы спальник и палатка
+// не тикали синхронно и не выпадали в один кадр на соседних полосах
+function nextRareInterval(){
+  return RARE_ITEM_INTERVAL + (Math.random()*2-1)*RARE_ITEM_JITTER;
+}
+
+function spawnRare(type){
+  // полосы, свободные от препятствий И от других предметов у верха
+  const free = freeLanesNow().filter(laneFreeForItem);
+  if (!free.length) return;
+  const lane = free[(Math.random()*free.length)|0];
+  game.items.push({lane, y:SPAWN_Y, type});
+}
+
+function spawnBear(){
+  // медведь на одной случайной полосе, всегда оставляя путь для ухода
+  const free = freeLanesNow();
+  // нужно минимум 2 свободные: одна под медведя, минимум одна для ухода игрока
+  if (free.length < 2) return false;
+  // полоса под самого медведя — без предмета у верха (иначе наложение бонуса на медведя)
+  const candidates = free.filter(l=>!laneHasItemNearTop(l));
+  // оставляем минимум одну полосу под уход: на медведя берём, только если после него
+  // останется ≥1 свободная полоса
+  if (candidates.length === 0) return false;
+  if (free.length - 1 < 1) return false; // подстраховка инварианта ухода
+  const lane = candidates[(Math.random()*candidates.length)|0];
+  game.bear = {lane, y:SPAWN_Y, warnT:BEAR_WARNING_MS};
+  return true;
+}
+
+// =================================================================
+// === ОБНОВЛЕНИЕ (dt в секундах) =================================
+// =================================================================
+function update(dt){
+  if (game.phase !== 'running') return;
+
+  applyInput();
+
+  // переход между полосами
+  if (game.switchT > 0){
+    game.switchT -= dt*1000;
+    if (game.switchT <= 0){ game.switchT = 0; game.lane = game.toLane; }
+  }
+
+  // неуязвимость
+  if (game.invulnT > 0) game.invulnT -= dt*1000;
+
+  // скорость и дистанция
+  game.speed = currentSpeed();
+  const dMeters = game.speed * dt;
+  game.distance += dMeters;
+  game.distSinceHit += dMeters;
+  game.score += dMeters * SCORE_PER_METER;
+
+  // бонус «без урона» каждые 500 м
+  if (game.distSinceHit >= NOHIT_BONUS_DIST){
+    game.score += NOHIT_BONUS_PTS;
+    game.distSinceHit -= NOHIT_BONUS_DIST;
+  }
+
+  // скорость движения объектов в пикселях/сек — ПОСТОЯННА (честность скорости v1.1)
+  const pxSpeed = scrollPxPerSec();
+
+  // прокрутка фонового паттерна синхронно с объектами (та же пиксельная скорость)
+  game.bgScroll = (game.bgScroll||0) + pxSpeed*dt;
+
+  // спавн препятствий по таймеру
+  game.obstTimer -= dt;
+  if (game.obstTimer <= 0){
+    spawnObstacles();
+    game.obstTimer = obstacleInterval();
+  }
+
+  // спавн частых предметов (# нет в правилах, подобрано: интервал)
+  game.commonTimer -= dt;
+  if (game.commonTimer <= 0){
+    const free = freeLanesNow();
+    if (free.length){
+      spawnItem(free[(Math.random()*free.length)|0]);
+    }
+    game.commonTimer = 4 + Math.random()*3; // # нет в правилах, подобрано
+  }
+
+  // спавн редких предметов (примерно 1 на 30 сек каждый, с разбросом)
+  for (const rt of RARE_ITEMS){
+    game.rareTimer[rt] -= dt;
+    if (game.rareTimer[rt] <= 0){
+      // если другой редкий предмет уже летит у верха — откладываем, чтобы не выпадали парой
+      const otherRareNearTop = game.items.some(it =>
+        RARE_ITEMS.includes(it.type) && it.type !== rt && it.y < H*0.35);
+      if (otherRareNearTop){
+        game.rareTimer[rt] = 3 + Math.random()*4; // # нет в правилах, подобрано: короткая отсрочка
+      } else {
+        spawnRare(rt);
+        game.rareTimer[rt] = nextRareInterval();
+      }
+    }
+  }
+
+  // медведь: таймер до возможного появления
+  game.bearTimer -= dt;
+  if (!game.bear && game.bearTimer <= 0){
+    if (spawnBear()) game.bearTimer = BEAR_MIN_INTERVAL;
+    else game.bearTimer = 1; // попробуем чуть позже, если полос мало
+  }
+
+  // ПРЕДОХРАНИТЕЛЬ: если предмет всё же оказался на одной полосе с препятствием
+  // или видимым медведем вплотную (любой порядок спавна) — убираем предмет,
+  // чтобы его нельзя было собрать только ценой удара
+  game.items = game.items.filter(it=>{
+    for (const o of game.obstacles){
+      if (o.lane === it.lane && Math.abs(o.y - it.y) < (OBST_SIZE/2 + ITEM_SIZE/2 + 6)) return false;
+    }
+    if (game.bear && game.bear.warnT <= 0 && game.bear.lane === it.lane &&
+        Math.abs(game.bear.y - it.y) < (BEAR_SIZE/2 + ITEM_SIZE/2 + 6)) return false;
+    return true;
+  });
+
+  // движение препятствий
+  for (const o of game.obstacles) o.y += pxSpeed*dt;
+  for (const it of game.items) it.y += pxSpeed*dt;
+
+  // медведь: фаза предупреждения, затем движется к игроку
+  if (game.bear){
+    if (game.bear.warnT > 0){
+      game.bear.warnT -= dt*1000;
+    } else {
+      game.bear.y += pxSpeed*dt;
+    }
+  }
+
+  // чистим ушедшие за низ
+  game.obstacles = game.obstacles.filter(o=>o.y < H+80);
+  game.items = game.items.filter(it=>it.y < H+80);
+  if (game.bear && game.bear.y > H+120) game.bear = null;
+
+  checkCollisions();
+}
+
+// =================================================================
+// === СТОЛКНОВЕНИЯ ================================================
+// =================================================================
+function overlap(objY, objSize){
+  const py = playerY();
+  return Math.abs(objY - py) < (objSize/2 + PLAYER_SIZE/2);
+}
+
+function checkCollisions(){
+  // полоса игрока для столкновений: целевая во время перехода, иначе текущая
+  // (не округляем дробную позицию — на середине перехода round мог "промахнуться")
+  const pLane = (game.switchT>0) ? game.toLane : game.lane;
+
+  // медведь — мгновенная смерть в обход жизней и любой неуязвимости
+  if (game.bear && game.bear.warnT <= 0){
+    if (pLane === game.bear.lane && overlap(game.bear.y, BEAR_SIZE)){
+      endRun(); return;
+    }
+  }
+
+  // препятствия
+  for (const o of game.obstacles){
+    if (o.hit) continue;
+    if (o.lane === pLane && overlap(o.y, OBST_SIZE)){
+      o.hit = true; // помечаем, чтобы тот же объект не бил повторно
+      if (game.invulnT > 0) continue; // во время неуязвимости урон не считается
+      game.lives -= 1;
+      game.distSinceHit = 0;
+      game.invulnT = INVULN_MS;
+      if (game.lives <= 0){ endRun(); return; }
+    }
+  }
+
+  // бонусы
+  for (let i=game.items.length-1;i>=0;i--){
+    const it = game.items[i];
+    if (it.lane === pLane && overlap(it.y, ITEM_SIZE)){
+      game.items.splice(i,1);
+      game.score += ITEM_SCORE;
+      game.collected[it.type]++;
+      if (it.type === 'sleep' && game.lives < START_LIVES) game.lives++; // спальник: +1 жизнь, если <3
+      if (it.type === 'tent') game.invulnT = Math.max(game.invulnT, TENT_INVULN_MS); // палатка: 3 сек неуязвимости
+    }
+  }
+}
+
+function endRun(){
+  game.phase = 'camp';
+  const sc = Math.round(game.score), ds = Math.round(game.distance);
+  game.recordBeaten = (sc > bestScore || ds > bestDist);
+  if (sc > bestScore) bestScore = sc;
+  if (ds > bestDist) bestDist = ds;
+}
+
+// =================================================================
+// === ОТРИСОВКА ===================================================
+// =================================================================
+// =================================================================
+// === СПРАЙТЫ ХУДОЖНИКА (встроены из pohod_sprites.js, v3) ========
+// =================================================================
+// =====================================================================
+//  РАННЕР «ПОХОД» — НАБОР ОТРИСОВКИ (флэт-вектор, вид сверху)
+//  Все функции рисуют от ЦЕНТРА (x,y) и масштабируются от size —
+//  сигнатура совпадает с drawRoundedSquare(x,y,s) из прототипа.
+//
+//  ПАЛИТРА / КЛЮЧ: контур #1E2818 везде, флэт-заливки, кислотно-зелёный
+//  #C6E84B — язык снаряжения и акцент персонажа; у препятствий его нет.
+//
+//  РАЗМЕРЫ берутся из констант прототипа:
+//    предмет   ITEM_SIZE   = 38
+//    препятст. OBST_SIZE   = 46
+//    медведь   BEAR_SIZE   = 72
+//    игрок     PLAYER_SIZE = 44
+//    иконки привала — 30px (свой масштаб, не из констант)
+// =====================================================================
+
+const OUTLINE = '#1E2818';
+
+// --- общая утилита: прямоугольник со скруглением ---
+function rr(ctx, rx, ry, w, h, r){
+  ctx.beginPath(); ctx.moveTo(rx+r, ry);
+  ctx.arcTo(rx+w, ry,   rx+w, ry+h, r);
+  ctx.arcTo(rx+w, ry+h, rx,   ry+h, r);
+  ctx.arcTo(rx,   ry+h, rx,   ry,   r);
+  ctx.arcTo(rx,   ry,   rx+w, ry,   r);
+  ctx.closePath();
+}
+
+// =====================================================================
+//  ПЕРСОНАЖ (PLAYER_SIZE = 44) — вид сверху
+//  Широкие плечи горизонт. овалом, локти наружу, голова: овал кожи +
+//  меньший овал волос сверху. Рюкзак — кислотный акцент.
+// =====================================================================
+
+const P_SKIN='#E8C9A0', P_JACKET='#D98A3A', P_JACKET_D='#bf7530',
+      P_PACK='#C6E84B', P_PANTS='#3A4A26', P_HAIR='#3A2A1A';
+
+// Поза бега. phase 0..1 — фаза шага (качание рук/ног). Можно не передавать.
+// В игре: drawPlayerRun(ctx, px, playerY(), PLAYER_SIZE, (performance.now()/600)%1)
+function drawPlayerRun(ctx, x, y, size, phase){
+  if (phase === undefined) phase = 0;
+  const sw = Math.sin(phase*Math.PI*2);
+  const s = size/44; ctx.save(); ctx.translate(x-size/2, y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.lineCap='round'; ctx.strokeStyle=OUTLINE;
+
+  // ноги — короткие, шаг по фазе
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=7;
+  ctx.beginPath(); ctx.moveTo(18,30); ctx.lineTo(16, 38+sw*3); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(26,30); ctx.lineTo(28, 38-sw*3); ctx.stroke();
+  ctx.strokeStyle=P_PANTS; ctx.lineWidth=4.5;
+  ctx.beginPath(); ctx.moveTo(18,30); ctx.lineTo(16, 38+sw*3); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(26,30); ctx.lineTo(28, 38-sw*3); ctx.stroke();
+
+  // руки — согнуты, локти наружу, кисти вперёд; качаются в противофазе
+  function arm(side){
+    const sx = 22 + side*9;
+    const ex = 22 + side*19;
+    const ey = 19 + side*sw*3;
+    const hx = 22 + side*15;
+    const hy = 9 - side*sw*4;
+    ctx.lineCap='round';
+    ctx.strokeStyle=OUTLINE;  ctx.lineWidth=6.5;
+    ctx.beginPath(); ctx.moveTo(sx,20); ctx.lineTo(ex,ey); ctx.lineTo(hx,hy); ctx.stroke();
+    ctx.strokeStyle=P_JACKET; ctx.lineWidth=4;
+    ctx.beginPath(); ctx.moveTo(sx,20); ctx.lineTo(ex,ey); ctx.lineTo(hx,hy); ctx.stroke();
+    ctx.fillStyle=P_SKIN; ctx.beginPath(); ctx.arc(hx,hy,3,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle=OUTLINE; ctx.lineWidth=1.5; ctx.stroke();
+  }
+  arm(-1); arm(1);
+
+  // плечи — широкий горизонтальный овал
+  ctx.beginPath(); ctx.ellipse(22,22,14,9,0,0,Math.PI*2);
+  ctx.fillStyle=P_JACKET; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle=OUTLINE; ctx.stroke();
+  ctx.strokeStyle=P_JACKET_D; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(22,15); ctx.lineTo(22,30); ctx.stroke();
+
+  // рюкзак — кислотный акцент, уже плеч
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=2;
+  rr(ctx,15,17,14,11,4); ctx.fillStyle=P_PACK; ctx.fill(); ctx.stroke();
+  ctx.strokeStyle='#8aa82f'; ctx.lineWidth=1.8;
+  ctx.beginPath(); ctx.moveTo(19,18); ctx.lineTo(19,27); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(25,18); ctx.lineTo(25,27); ctx.stroke();
+
+  // голова: большой овал кожи + меньший овал волос (сдвиг назад)
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.ellipse(22,10,8,7,0,0,Math.PI*2);
+  ctx.fillStyle=P_SKIN; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(22,11.5,6.5,5.5,0,0,Math.PI*2);
+  ctx.fillStyle=P_HAIR; ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+// Спокойная поза (экран привала). В игре: drawPlayerRest(ctx, W/2, H*0.6, PLAYER_SIZE*1.4)
+function drawPlayerRest(ctx, x, y, size){
+  const s = size/44; ctx.save(); ctx.translate(x-size/2, y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.lineCap='round'; ctx.strokeStyle=OUTLINE;
+
+  // ноги вытянуты вперёд
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=7;
+  ctx.beginPath(); ctx.moveTo(19,31); ctx.lineTo(17,39); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(25,31); ctx.lineTo(27,39); ctx.stroke();
+  ctx.strokeStyle=P_PANTS; ctx.lineWidth=4.5;
+  ctx.beginPath(); ctx.moveTo(19,31); ctx.lineTo(17,39); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(25,31); ctx.lineTo(27,39); ctx.stroke();
+
+  // руки расслаблены вдоль корпуса
+  function arm(side){
+    const sx=22+side*9, ex=22+side*13, hx=22+side*10;
+    ctx.strokeStyle=OUTLINE;  ctx.lineWidth=6;
+    ctx.beginPath(); ctx.moveTo(sx,22); ctx.lineTo(ex,28); ctx.lineTo(hx,32); ctx.stroke();
+    ctx.strokeStyle=P_JACKET; ctx.lineWidth=3.5;
+    ctx.beginPath(); ctx.moveTo(sx,22); ctx.lineTo(ex,28); ctx.lineTo(hx,32); ctx.stroke();
+    ctx.fillStyle=P_SKIN; ctx.beginPath(); ctx.arc(hx,32,2.6,0,Math.PI*2); ctx.fill();
+  }
+  arm(-1); arm(1);
+
+  // плечи компактнее
+  ctx.beginPath(); ctx.ellipse(22,24,12,9,0,0,Math.PI*2);
+  ctx.fillStyle=P_JACKET; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle=OUTLINE; ctx.stroke();
+  ctx.strokeStyle=P_JACKET_D; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(22,17); ctx.lineTo(22,31); ctx.stroke();
+
+  // рюкзак — как в позе бега: с лямками, чуть крупнее
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=2;
+  rr(ctx,15,18,14,11,4); ctx.fillStyle=P_PACK; ctx.fill(); ctx.stroke();
+  ctx.strokeStyle='#8aa82f'; ctx.lineWidth=1.8;
+  ctx.beginPath(); ctx.moveTo(19,19); ctx.lineTo(19,28); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(25,19); ctx.lineTo(25,28); ctx.stroke();
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=2;
+
+  // голова
+  ctx.beginPath(); ctx.ellipse(22,12,8,7,0,0,Math.PI*2);
+  ctx.fillStyle=P_SKIN; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(22,13.5,6.5,5.5,0,0,Math.PI*2);
+  ctx.fillStyle=P_HAIR; ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+// =====================================================================
+//  СНАРЯЖЕНИЕ (ITEM_SIZE = 38) — кислотный акцент на каждом
+//  В игре по it.type: drawFlask/drawPot/drawSleep/drawTent(ctx, cx, it.y, ITEM_SIZE)
+// =====================================================================
+
+function drawFlask(ctx, x, y, size){
+  const s = size/38; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  rr(ctx,15,3,8,8,2); ctx.fillStyle='#7E8C4E'; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(13,9); ctx.quadraticCurveTo(8,11,11,17);
+  ctx.strokeStyle='#3A4A26'; ctx.lineWidth=2; ctx.stroke();
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.ellipse(19,21,12,12,0,0,Math.PI*2);
+  ctx.fillStyle='#5A6B3A'; ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#C6E84B'; ctx.beginPath(); ctx.arc(19,21,7,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#5A6B3A'; ctx.beginPath(); ctx.arc(19,21,3.2,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawPot(ctx, x, y, size){
+  const s = size/38; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  // дужка-ручка над котелком (полукольцо)
+  ctx.lineWidth=2.5;
+  ctx.beginPath(); ctx.arc(19,18,11,Math.PI*1.12,Math.PI*1.88,false); ctx.stroke();
+  ctx.lineWidth=2;
+  // корпус котелка (низ — полукруг: ширина ≈ радиусу дна)
+  ctx.beginPath();
+  ctx.moveTo(8,18); ctx.lineTo(30,18);
+  ctx.lineTo(30,20);
+  ctx.arc(19,20,11,0,Math.PI,false);
+  ctx.lineTo(8,18);
+  ctx.closePath();
+  ctx.fillStyle='#C9C9C9'; ctx.fill(); ctx.stroke();
+  // ободок крышки — кислотный акцент
+  ctx.strokeStyle='#C6E84B'; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.moveTo(8,19.5); ctx.lineTo(30,19.5); ctx.stroke();
+  // ушки крепления дужки
+  ctx.fillStyle='#7a7a7a'; ctx.strokeStyle=OUTLINE; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.arc(9,18,2,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(29,18,2,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawSleep(ctx, x, y, size){
+  const s = size/38; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  // вертикальный рулон
+  rr(ctx,11,5,16,28,8); ctx.fillStyle='#5FBF6F'; ctx.fill(); ctx.stroke();
+  // торец-спираль сверху
+  ctx.fillStyle='#3f9e51'; ctx.beginPath(); ctx.ellipse(19,11,7,4.5,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#7fd98e'; ctx.beginPath(); ctx.ellipse(19,11,3.5,2,0,0,Math.PI*2); ctx.fill();
+  // кислотная стяжка-ремешок поперёк
+  ctx.fillStyle='#C6E84B'; ctx.fillRect(11,22,16,4); ctx.strokeRect(11,22,16,4);
+  ctx.restore();
+}
+
+function drawTent(ctx, x, y, size){
+  const s = size/38; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  ctx.beginPath(); ctx.moveTo(19,4); ctx.lineTo(34,32); ctx.lineTo(4,32); ctx.closePath();
+  ctx.fillStyle='#D94F4F'; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(19,4); ctx.lineTo(19,32); ctx.lineTo(4,32); ctx.closePath();
+  ctx.fillStyle='#b53e3e'; ctx.fill();
+  ctx.fillStyle='#3a1f1f';
+  ctx.beginPath(); ctx.moveTo(19,16); ctx.lineTo(25,32); ctx.lineTo(13,32); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle='#C6E84B'; ctx.lineWidth=2.5;
+  ctx.beginPath(); ctx.moveTo(19,4); ctx.lineTo(19,17); ctx.stroke();
+  ctx.restore();
+}
+
+// =====================================================================
+//  ПРЕПЯТСТВИЯ (OBST_SIZE = 46) — без кислотного акцента (отталкивают)
+//  В игре по o.type: drawStone/drawBranch/drawPuddle(ctx, cx, o.y, OBST_SIZE)
+// =====================================================================
+
+function drawStone(ctx, x, y, size){
+  const s = size/46; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  ctx.beginPath();
+  ctx.moveTo(10,20); ctx.lineTo(18,8); ctx.lineTo(33,11);
+  ctx.lineTo(39,24); ctx.lineTo(31,38); ctx.lineTo(14,36); ctx.closePath();
+  ctx.fillStyle='#8A8A8A'; ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#a8a8a8';
+  ctx.beginPath(); ctx.moveTo(18,8); ctx.lineTo(33,11); ctx.lineTo(28,19); ctx.lineTo(16,17); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#6e6e6e';
+  ctx.beginPath(); ctx.moveTo(14,36); ctx.lineTo(31,38); ctx.lineTo(33,30); ctx.lineTo(16,29); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function drawBranch(ctx, x, y, size){
+  const s = size/46; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineCap='round'; ctx.strokeStyle=OUTLINE;
+  ctx.lineWidth=11; ctx.beginPath(); ctx.moveTo(9,36); ctx.lineTo(37,10); ctx.stroke();
+  ctx.strokeStyle='#7A4A23'; ctx.lineWidth=8; ctx.beginPath(); ctx.moveTo(9,36); ctx.lineTo(37,10); ctx.stroke();
+  // светлый блик-кора на основном стволе (под отростками)
+  ctx.strokeStyle='#9c6638'; ctx.lineWidth=2.5;
+  ctx.beginPath(); ctx.moveTo(12,33); ctx.lineTo(34,13); ctx.stroke();
+  // боковые отростки — поверх блика
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=7;
+  ctx.beginPath(); ctx.moveTo(22,23); ctx.lineTo(33,26); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(18,27); ctx.lineTo(12,18); ctx.stroke();
+  ctx.strokeStyle='#7A4A23'; ctx.lineWidth=4.5;
+  ctx.beginPath(); ctx.moveTo(22,23); ctx.lineTo(33,26); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(18,27); ctx.lineTo(12,18); ctx.stroke();
+  ctx.restore();
+}
+
+function drawPuddle(ctx, x, y, size){
+  const s = size/46; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineJoin='round';
+  ctx.beginPath();
+  ctx.moveTo(8,24);
+  ctx.bezierCurveTo(6,15, 18,9, 26,12);
+  ctx.bezierCurveTo(38,10, 41,22, 36,28);
+  ctx.bezierCurveTo(34,38, 18,40, 11,34);
+  ctx.bezierCurveTo(7,32, 8,28, 8,24);
+  ctx.closePath();
+  // мягкий край в тон воды (без чёрного контура)
+  ctx.fillStyle='#6A89A7'; ctx.fill();
+  ctx.strokeStyle='#587692'; ctx.lineWidth=2; ctx.stroke();
+  // приглушённый блик
+  ctx.strokeStyle='#86a1ba'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.ellipse(22,24,9,6,-0.2,0,Math.PI*2); ctx.stroke();
+  ctx.fillStyle='#9db4c8';
+  ctx.beginPath(); ctx.ellipse(18,21,3,1.6,-0.3,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// =====================================================================
+//  МЕДВЕДЬ (BEAR_SIZE = 72) — крупнее, светлый мех отрывается от фона,
+//  кислотные глаза = сигнал опасности. В игре: drawBear(ctx, cx, bear.y, BEAR_SIZE)
+// =====================================================================
+
+function drawBear(ctx, x, y, size){
+  const s = size/72; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=3; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  const FUR='#3A2C1E', FUR_D='#2b2016', BELLY='#5A4730';
+  // лапы: верхние — короткие овалы; нижние — длиннее, вытянуты вниз
+  ctx.fillStyle=FUR_D;
+  for (const [lx,ly] of [[11,32],[61,32]]){
+    ctx.beginPath(); ctx.ellipse(lx,ly,8,7,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  }
+  for (const [lx,ly] of [[17,64],[55,64]]){
+    ctx.beginPath(); ctx.ellipse(lx,ly,8,12,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  }
+  // туша — вытянутый по вертикали овал
+  ctx.beginPath(); ctx.ellipse(36,43,23,30,0,0,Math.PI*2);
+  ctx.fillStyle=FUR; ctx.fill(); ctx.stroke();
+  // живот — светлый овал на пару тонов светлее меха
+  ctx.beginPath(); ctx.ellipse(36,46,13,19,0,0,Math.PI*2);
+  ctx.fillStyle=BELLY; ctx.fill();
+  // голова
+  ctx.beginPath(); ctx.arc(36,20,16,0,Math.PI*2);
+  ctx.fillStyle=FUR; ctx.fill(); ctx.stroke();
+  // уши
+  for (const ex of [24,48]){ ctx.beginPath(); ctx.arc(ex,9,6,0,Math.PI*2);
+    ctx.fillStyle=FUR; ctx.fill(); ctx.stroke(); }
+  // морда (светлая, как в примере — отрывается от тёмного меха)
+  ctx.beginPath(); ctx.ellipse(36,25,8.5,6.5,0,0,Math.PI*2);
+  ctx.fillStyle='#C9B58A'; ctx.fill(); ctx.stroke();
+  // глаза — кислотная угроза
+  ctx.fillStyle='#C6E84B';
+  ctx.beginPath(); ctx.arc(30,17,2.8,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(42,17,2.8,0,Math.PI*2); ctx.fill();
+  // нос
+  ctx.fillStyle=OUTLINE; ctx.beginPath(); ctx.ellipse(36,24,2.6,2,0,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// =====================================================================
+//  ИКОНКИ ЭКРАНА ПРИВАЛА (сетка 28px) — упрощённые версии снаряжения.
+//  Рисуются на прозрачном фоне, кладутся прямо на тёмный оверлей.
+//  См. ниже helper drawCampGear для строки со счётчиками.
+// =====================================================================
+
+function iconTent(ctx,x,y,size){
+  const s=size/28; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  ctx.beginPath(); ctx.moveTo(14,4); ctx.lineTo(25,24); ctx.lineTo(3,24); ctx.closePath();
+  ctx.fillStyle='#D94F4F'; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(14,4); ctx.lineTo(14,24); ctx.lineTo(3,24); ctx.closePath();
+  ctx.fillStyle='#b53e3e'; ctx.fill();
+  ctx.fillStyle='#3a1f1f';
+  ctx.beginPath(); ctx.moveTo(14,13); ctx.lineTo(19,24); ctx.lineTo(9,24); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle='#C6E84B'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(14,4); ctx.lineTo(14,14); ctx.stroke();
+  ctx.restore();
+}
+
+function iconPot(ctx,x,y,size){
+  const s=size/28; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(14,14,8,Math.PI*1.12,Math.PI*1.88,false); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(5,13); ctx.lineTo(23,13);
+  ctx.lineTo(23,15);
+  ctx.arc(14,15,9,0,Math.PI,false);
+  ctx.lineTo(5,13);
+  ctx.closePath();
+  ctx.fillStyle='#C9C9C9'; ctx.fill(); ctx.stroke();
+  ctx.strokeStyle='#C6E84B'; ctx.lineWidth=2.5;
+  ctx.beginPath(); ctx.moveTo(5,14.5); ctx.lineTo(23,14.5); ctx.stroke();
+  ctx.restore();
+}
+
+function iconSleep(ctx,x,y,size){
+  const s=size/28; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  rr(ctx,8,3,12,22,5.5); ctx.fillStyle='#5FBF6F'; ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#3f9e51'; ctx.beginPath(); ctx.ellipse(14,8,5,3.2,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#7fd98e'; ctx.beginPath(); ctx.ellipse(14,8,2.4,1.4,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#C6E84B'; ctx.fillRect(8,16,12,3); ctx.strokeRect(8,16,12,3);
+  ctx.restore();
+}
+
+function iconFlask(ctx,x,y,size){
+  const s=size/28; ctx.save(); ctx.translate(x-size/2,y-size/2); ctx.scale(s,s);
+  ctx.lineWidth=2; ctx.lineJoin='round'; ctx.strokeStyle=OUTLINE;
+  rr(ctx,11,2,6,6,1.5); ctx.fillStyle='#7E8C4E'; ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(10,7); ctx.quadraticCurveTo(6,9,8,13);
+  ctx.strokeStyle='#3A4A26'; ctx.lineWidth=1.8; ctx.stroke();
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.ellipse(14,16,9,9,0,0,Math.PI*2);
+  ctx.fillStyle='#5A6B3A'; ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#C6E84B'; ctx.beginPath(); ctx.arc(14,16,5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#5A6B3A'; ctx.beginPath(); ctx.arc(14,16,2.3,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+// Строка собранного снаряжения для drawCamp. iy — y-координата ряда иконок.
+// Внутри drawCamp: drawCampGear(ctx, W, y, game.collected); y += 50;
+function drawCampGear(ctx, W, iy, collected){
+  const types = [['tent',iconTent],['pot',iconPot],['sleep',iconSleep],['flask',iconFlask]];
+  const ICON = 60, gap = 90, startX = W/2 - (types.length-1)*gap/2; // +15% к размеру, шаг под него
+  ctx.textAlign='center'; ctx.font='18px system-ui,sans-serif'; ctx.fillStyle='#cdd6c4';
+  types.forEach(([t,fn],i)=>{
+    const ix = startX + i*gap;
+    fn(ctx, ix, iy, ICON);
+    ctx.fillText('×'+(collected[t]||0), ix, iy+ICON/2+18);
+  });
+}
+
+// =====================================================================
+//  ФОН ТРЁХ ПОЛОС — бесшовный вертикальный паттерн (тропа центр, трава бока).
+//  В draw() ПЕРВЫМ, вместо текущей заливки полос:
+//     drawBackground(ctx, W, H, game.bgScroll);
+//  В update(), синхронно с объектами (честность скорости — пиксели постоянны):
+//     game.bgScroll = (game.bgScroll||0) + scrollPxPerSec()*dt;
+// =====================================================================
+
+const BG_TILE = 140;                              // высота тайла (бесшовно по вертикали)
+const BG_LANES = 3;
+const BG_G_DARK='#2f4327', BG_G_LIGHT='#37502d';  // трава
+const BG_PATH='#6b5436', BG_PATH_SH='#5e4a30', BG_PATH_HI='#7d6342'; // тропа
+const BG_SEP='#27331f';                            // разделитель полос
+const BG_BUSH='#33502b', BG_BUSH_HI='#3f6234';     // куст по краям (тёмно-зелёный)
+
+// детерминированный псевдослучай по сетке -> каждая копия тайла идентична
+function bgRnd(i){ const x=Math.sin(i*127.1+311.7)*43758.5453; return x-Math.floor(x); }
+
+// один тайл в локальных координатах; стык y=0 и y=BG_TILE совпадает
+// куст из края: кучка кружков, частично за кадром (cx у самой кромки)
+function drawBush(ctx, cx, cy, scale){
+  const blobs = [[0,0,11],[8,-4,8],[-8,-3,8],[3,6,7],[-4,5,6]];
+  ctx.strokeStyle=OUTLINE; ctx.lineWidth=2;
+  for (const [dx,dy,r] of blobs){
+    ctx.beginPath(); ctx.ellipse(cx+dx*scale, cy+dy*scale, r*scale, r*scale, 0,0,Math.PI*2);
+    ctx.fillStyle=BG_BUSH; ctx.fill(); ctx.stroke();
+  }
+  // светлый верх-подсветка
+  ctx.fillStyle=BG_BUSH_HI;
+  ctx.beginPath(); ctx.ellipse(cx-3*scale, cy-4*scale, 4*scale, 4*scale, 0,0,Math.PI*2); ctx.fill();
+}
+
+function drawBgTile(ctx, w, oy, tIdx){
+  tIdx = tIdx || 0;
+  const laneW = w/BG_LANES;
+  for (let l=0;l<BG_LANES;l++){
+    const x=l*laneW, isPath=(l===1);
+    ctx.fillStyle = isPath ? BG_PATH : (l%2 ? BG_G_LIGHT : BG_G_DARK);
+    ctx.fillRect(x, oy, laneW, BG_TILE+1);
+  }
+  ctx.fillStyle=BG_PATH_SH;
+  ctx.fillRect(laneW+2, oy, 5, BG_TILE+1);
+  ctx.fillRect(2*laneW-7, oy, 5, BG_TILE+1);
+  for (let i=0;i<7;i++){
+    const y = oy + ((i+0.5)/7)*BG_TILE;
+    const cx = laneW + 6 + bgRnd(i)*(laneW-12);
+    const r = 2 + bgRnd(i+50)*3;
+    ctx.fillStyle = bgRnd(i+9)>0.5 ? BG_PATH_HI : BG_PATH_SH;
+    ctx.beginPath(); ctx.ellipse(cx, y, r, r*0.7, 0, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.strokeStyle='#3f5a33'; ctx.lineWidth=2; ctx.lineCap='round';
+  for (let i=0;i<10;i++){
+    const y = oy + ((i+0.5)/10)*BG_TILE;
+    let bx = 6 + bgRnd(i+1)*(laneW-12);
+    ctx.beginPath(); ctx.moveTo(bx,y); ctx.lineTo(bx+(bgRnd(i+2)-0.5)*4, y-5); ctx.stroke();
+    let rx = 2*laneW+6 + bgRnd(i+3)*(laneW-12);
+    ctx.beginPath(); ctx.moveTo(rx,y); ctx.lineTo(rx+(bgRnd(i+4)-0.5)*4, y-5); ctx.stroke();
+  }
+  // кусты у самых краёв — изредка, по-разному на каждом тайле (бесшовно по позиции)
+  for (let i=0;i<2;i++){
+    const y = oy + ((i+0.35)/2)*BG_TILE;
+    const seed = tIdx*13 + i*101;
+    // левый край
+    if (bgRnd(seed+5) > 0.72){
+      const sc = 1.3 + bgRnd(seed+6)*0.7;
+      drawBush(ctx, 0, y, sc);
+    }
+    // правый край
+    if (bgRnd(seed+41) > 0.72){
+      const sc = 1.3 + bgRnd(seed+42)*0.7;
+      drawBush(ctx, w, y, sc);
+    }
+  }
+  ctx.strokeStyle=BG_SEP; ctx.lineWidth=2;
+  for (let l=1;l<BG_LANES;l++){
+    ctx.beginPath(); ctx.moveTo(l*laneW, oy); ctx.lineTo(l*laneW, oy+BG_TILE+1); ctx.stroke();
+  }
+}
+
+function drawBackground(ctx, w, h, scrollY){
+  const off = ((scrollY % BG_TILE) + BG_TILE) % BG_TILE;
+  // номер тайла по абсолютной прокрутке — стабилен, пока тайл едет по экрану
+  const base = Math.floor(scrollY / BG_TILE);
+  let k = 0;
+  for (let y = -off; y < h; y += BG_TILE){
+    drawBgTile(ctx, w, y, base + k);
+    k++;
+  }
+}
+
+// =====================================================================
+//  КАРТА ПОДКЛЮЧЕНИЯ (что на что менять в прототипе)
+//  ─────────────────────────────────────────────────────────────────
+//  draw():
+//    • удалить блок заливки полос + серые разделители
+//    • первой строкой:  drawBackground(ctx, W, H, game.bgScroll||0);
+//    • препятствия:  drawStone/drawBranch/drawPuddle(ctx, laneCenterX(o.lane), o.y, OBST_SIZE)
+//                    (выбор по o.type: stone/branch/puddle)
+//    • бонусы:       drawFlask/drawPot/drawSleep/drawTent(ctx, laneCenterX(it.lane), it.y, ITEM_SIZE)
+//                    (выбор по it.type: flask/pot/sleep/tent)
+//    • игрок:        drawPlayerRun(ctx, px, playerY(), PLAYER_SIZE, (performance.now()/600)%1)
+//    • медведь:      drawBear(ctx, laneCenterX(game.bear.lane), game.bear.y, BEAR_SIZE)
+//  update():
+//    • game.bgScroll = (game.bgScroll||0) + scrollPxPerSec()*dt;
+//  drawCamp():
+//    • вместо строки эмодзи:  drawCampGear(ctx, W, y, game.collected); y += 50;
+//    • можно добавить сидящего: drawPlayerRest(ctx, W/2, H*0.6, PLAYER_SIZE*1.4)
+//  Маркер опасности медведя (warnT>0) оставить как есть — он часть логики.
+// =====================================================================
+
+// =================================================================
+// === МОСТ: выбор спрайт-функции по типу объекта ==================
+// =================================================================
+const OBST_DRAW = { stone:drawStone, branch:drawBranch, puddle:drawPuddle };
+const ITEM_DRAW = { flask:drawFlask, pot:drawPot, sleep:drawSleep, tent:drawTent };
+
+function drawRoundedSquare(x,y,s,col){
+  ctx.fillStyle=col;
+  const r=6;
+  ctx.beginPath();
+  ctx.moveTo(x-s/2+r,y-s/2);
+  ctx.arcTo(x+s/2,y-s/2,x+s/2,y+s/2,r);
+  ctx.arcTo(x+s/2,y+s/2,x-s/2,y+s/2,r);
+  ctx.arcTo(x-s/2,y+s/2,x-s/2,y-s/2,r);
+  ctx.arcTo(x-s/2,y-s/2,x+s/2,y-s/2,r);
+  ctx.fill();
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+
+  // фон трёх полос (бесшовный прокручиваемый паттерн от художника)
+  // знак минус: фон едет вниз вместе с препятствиями (игрок бежит вверх)
+  drawBackground(ctx, W, H, -(game.bgScroll||0));
+
+  // препятствия (спрайты по типу: камень/ветка/лужа)
+  for (const o of game.obstacles){
+    (OBST_DRAW[o.type]||drawStone)(ctx, laneCenterX(o.lane), o.y, OBST_SIZE*OBST_SCALE);
+  }
+
+  // бонусы (спрайты по типу: фляга/котелок/спальник/палатка)
+  for (const it of game.items){
+    (ITEM_DRAW[it.type]||drawFlask)(ctx, laneCenterX(it.lane), it.y, ITEM_SIZE*ITEM_SCALE);
+  }
+
+  // медведь + предупреждение
+  if (game.bear){
+    if (game.bear.warnT > 0){
+      // мигающий маркер опасности у верхнего края (логика, оставлена как есть)
+      if (Math.floor(game.bear.warnT/150)%2===0){
+        ctx.fillStyle=COL.warn;
+        ctx.beginPath(); ctx.arc(laneCenterX(game.bear.lane), 30, 16, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle='#fff'; ctx.font='bold 22px sans-serif'; ctx.textAlign='center';
+        ctx.fillText('!', laneCenterX(game.bear.lane), 38);
+      }
+    } else {
+      drawBear(ctx, laneCenterX(game.bear.lane), game.bear.y, BEAR_SIZE*BEAR_SCALE);
+    }
+  }
+
+  // игрок-бегун (мигает во время неуязвимости); фаза шага по времени
+  const px = laneCenterX(playerLaneFloat());
+  const blink = game.invulnT>0 && Math.floor(game.invulnT/120)%2===0;
+  if (!blink) drawPlayerRun(ctx, px, playerY(), PLAYER_SIZE*PLAYER_SCALE, (performance.now()/600)%1);
+
+  // HUD
+  drawHUD();
+
+  if (game.phase==='camp') drawCamp();
+}
+
+function drawHUD(){
+  ctx.textAlign='left'; ctx.fillStyle='#fff'; ctx.font='16px system-ui,sans-serif';
+  ctx.fillText('Очки: '+Math.round(game.score), 10, 24);
+  ctx.fillText('Метры: '+Math.round(game.distance), 10, 46);
+  // жизни (сердечки квадратиками)
+  for (let i=0;i<START_LIVES;i++){
+    ctx.fillStyle = i<game.lives ? '#e0453a' : '#444';
+    ctx.fillRect(W-30-i*24, 12, 18, 18);
+  }
+  // собранное снаряжение — настоящие иконки художника со счётчиками (внизу слева)
+  const HUD_ICON = 26;            // # нет в правилах, подобрано: размер иконки в HUD (×2 от прежних эмодзи)
+  const hudGear = [['tent',iconTent],['pot',iconPot],['sleep',iconSleep],['flask',iconFlask]];
+  const baseY = H - HUD_ICON/2 - 6;
+  let hx = 10 + HUD_ICON/2;
+  ctx.font='15px system-ui,sans-serif'; ctx.fillStyle='#e6eadf'; ctx.textAlign='left';
+  for (const [t,fn] of hudGear){
+    fn(ctx, hx, baseY, HUD_ICON);
+    ctx.fillText('×'+(game.collected[t]||0), hx + HUD_ICON/2 + 2, baseY + 5);
+    hx += HUD_ICON + 30; // иконка + место под счётчик
+  }
+}
+
+function drawCamp(){
+  ctx.fillStyle='rgba(0,0,0,0.78)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center'; ctx.fillStyle='#ffd24a';
+  ctx.font='bold 28px system-ui,sans-serif';
+  ctx.fillText('Привал', W/2, H*0.16);
+
+  // сидящий персонаж под заголовком
+  drawPlayerRest(ctx, W/2, H*0.30, PLAYER_SIZE*2.4);
+
+  ctx.fillStyle='#fff'; ctx.font='18px system-ui,sans-serif';
+  let y=H*0.42;
+  const line=(t)=>{ctx.fillText(t,W/2,y); y+=30;};
+  line('Дистанция: '+Math.round(game.distance)+' м');
+  line('Очки: '+Math.round(game.score));
+
+  // собранное снаряжение — иконки художника со счётчиками
+  y+=18;
+  drawCampGear(ctx, W, y, game.collected);
+  y+=78;
+
+  ctx.fillStyle='#9fd'; ctx.font='18px system-ui,sans-serif'; ctx.textAlign='center';
+  line('Рекорд: '+bestDist+' м / '+bestScore+' очк.');
+  if (game.recordBeaten){ ctx.fillStyle='#ffd24a'; line('★ Новый рекорд!'); }
+
+  // кнопка «Ещё разок»
+  const bw=200, bh=54, bx=W/2-bw/2, by=H*0.80;
+  ctx.fillStyle='#3a7a3a'; ctx.fillRect(bx,by,bw,bh);
+  ctx.fillStyle='#fff'; ctx.font='bold 20px system-ui,sans-serif';
+  ctx.fillText('Ещё разок', W/2, by+34);
+  // зона клика обрабатывается общим click/touchend
+}
+
+// =================================================================
+// === ГЛАВНЫЙ ЦИКЛ (requestAnimationFrame, движение через dt) ====
+// =================================================================
+let last = performance.now();
+function loop(now){
+  let dt = (now - last)/1000;
+  last = now;
+  if (dt > 0.05) dt = 0.05; // защита от больших скачков (вкладка была неактивна)
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
